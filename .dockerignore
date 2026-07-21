@@ -1,0 +1,17 @@
+# Exclude everything not needed in the image to keep build context small.
+# We DO include models/ (baked weights) — do not ignore it.
+# We DO include prompts/*.md (policy.md is attached to every critic call) —
+# the *.md rule below is overridden by keeping the prompts/ COPY explicit in
+# the Dockerfile (COPY prompts /app/prompts happens before .dockerignore can
+# exclude; .dockerignore only affects the build context sent, not COPY targets,
+# BUT to be safe we do NOT ignore prompts/**).
+.git
+.claude
+__pycache__
+*.pyc
+# Exclude loose docs but KEEP prompts/ (policy.md is needed at runtime).
+README.md
+test/
+scripts/bake_models.sh
+scripts/quantize_w4a16.sh
+*.log

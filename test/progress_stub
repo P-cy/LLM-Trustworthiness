@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stub for the judge-supplied /benchmark_lib/progress hook.
+# Real hook records "N questions processed". For local testing we echo the
+# arg to stdout AND append it to /result/progress.log so the test script can
+# assert it was called with the right count. /result is the writable mount.
+echo "$@"
+printf '%s\n' "$*" >> /result/progress.log

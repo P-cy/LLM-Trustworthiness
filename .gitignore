@@ -1,0 +1,40 @@
+# ============================================================
+# NEVER commit model weights — they are 38GB and downloaded from
+# HuggingFace at build time (Dockerfile Stage 1). Keep them out of git.
+# ============================================================
+models/
+**/models/
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+*.ckpt
+
+# HuggingFace download cache
+.cache/
+**/.cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Local build/test artifacts
+*.log
+bake.log
+build.log
+push*.log
+*.tmp
+.DS_Store
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+
+# Claude session state (not part of the project)
+.claude/
