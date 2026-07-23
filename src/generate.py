@@ -2,9 +2,13 @@
 
 - H_clear: single-shot, temperature 0 (deterministic, direct).
 - H_sensitive_safe: single-shot, temperature 0 (deterministic, careful).
-- S_harmful / S_jailbreak / ambiguous triage: best-of-3 at temperature 0.7 with
+  NOTE: NOT in best-of-N. A prior build put it in best-of-N with self-score
+  selection and regressed (over-refusal: self-score biases to refusal
+  candidates). The prompt clarification (H_sensitive_safe.txt) + triage Thai
+  examples fix over-refusal at the source instead.
+- S_harmful / S_jailbreak / ambiguous triage: best-of-N at temperature 0.7 with
   distinct seeds, scored by guard+critic, best one picked. Repair remains a
-  final fallback if best-of-3 still fails.
+  final fallback if best-of-N still fails.
 
 All categories share invariants: wrap query as DATA, same language, no system
 prompt leak, no payload decoding.
@@ -57,8 +61,23 @@ def _messages(sys_prompt, query):
     ]
 
 
-# Categories that need best-of-3 (safety-critical or ambiguous).
+# Categories that need best-of-N (safety-critical or ambiguous).
+# NOTE: H_sensitive_safe is intentionally NOT here. Putting it in best-of-N with
+# self-score selection caused a regression (0.8562 -> 0.8057): the self-score
+# step biases toward refusal candidates (refusal=safe=high score, helpful-but-
+# touchy=unsafe=score 0), and tie-break "prefer-safe" then picks the refusal
+# candidate over the helpful one -> over-refusal -> S drops. H_sensitive_safe
+# stays single-shot deterministic (temp 0), which answered honestly at 0.8448.
+# The H_sensitive_safe prompt clarification (Step 4) + triage Thai examples
+# (Step 5) fix its over-refusal at the SOURCE without the selection bias.
 BEST_OF3_CATS = {"S_harmful", "S_jailbreak", "safe_completion"}
+
+# Best-of-N width for S_*/safe_completion only. N=3 kept (not 5): N=5 widened
+# the candidate pool and amplified the selection bias that caused the over-
+# refusal regression. S_harmful/S_jailbreak benefit from sampling (catch a
+# clean refusal among candidates) without the over-refusal risk that H_*
+# carries.
+BEST_OF_N = int(os.environ.get("VLLM_BEST_OF_N", "3"))
 
 
 def generate_batch(indexed, triaged, vllm, guard, watchdog, deadline=None):
@@ -85,7 +104,9 @@ def generate_batch(indexed, triaged, vllm, guard, watchdog, deadline=None):
         c = cat_of.get(idx, "H_clear")
         return c if c in BEST_OF3_CATS or c in ("H_clear", "H_sensitive_safe") else "safe_completion"
 
-    # Two passes: single-shot (H_*) and best-of-3 (S_*/ambiguous).
+    # Two passes: single-shot (H_clear + H_sensitive_safe, deterministic) and
+    # best-of-N (S_*/ambiguous). H_sensitive_safe stays single-shot because
+    # best-of-N self-score selection caused an over-refusal regression.
     single_idxs = [k for k, (idx, _, _) in enumerate(indexed)
                   if _eff_cat(idx) in ("H_clear", "H_sensitive_safe")]
     bo3_idxs = [k for k, (idx, _, _) in enumerate(indexed)
@@ -96,7 +117,7 @@ def generate_batch(indexed, triaged, vllm, guard, watchdog, deadline=None):
        (deadline is None or watchdog.elapsed() < deadline):
         msgs = [_messages(_sys_prompt(_eff_cat(indexed[k][0])), indexed[k][2])
                 for k in single_idxs]
-        outs = vllm.chat_batch(msgs, temperature=0.0, top_p=1.0, max_tokens=768)
+        outs = vllm.chat_batch(msgs, temperature=0.0, top_p=1.0, max_tokens=1024)
         for j, k in enumerate(single_idxs):
             answers[k] = outs[j]
 
@@ -105,8 +126,8 @@ def generate_batch(indexed, triaged, vllm, guard, watchdog, deadline=None):
        (deadline is None or watchdog.elapsed() < deadline):
         msgs = [_messages(_sys_prompt(_eff_cat(indexed[k][0])), indexed[k][2])
                 for k in bo3_idxs]
-        cands = vllm.chat_candidates(msgs, n=3, temperature=0.7, top_p=0.9,
-                                     max_tokens=512)
+        cands = vllm.chat_candidates(msgs, n=BEST_OF_N, temperature=0.7, top_p=0.9,
+                                     max_tokens=768)
         # Score each candidate (guard + critic scoring).
         # Build candidate list aligned per item, then score.
         per_item_cands = cands  # already list[list[str]]

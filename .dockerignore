@@ -15,3 +15,14 @@ test/
 scripts/bake_models.sh
 scripts/quantize_w4a16.sh
 *.log
+# Throwaway probe / helper scripts — never baked into the image (Dockerfile only
+# COPYs run.py, entrypoint.sh, src/, prompts/). Exclude so they don't bloat the
+# build context or ship by accident.
+_*_probe.py
+_vllm_probe.py
+_int4_*.py
+_guard_probe.py
+build_push_linux.sh
+build_push_q35.sh
+mac_build_push.sh
+mac_smoke_test.sh

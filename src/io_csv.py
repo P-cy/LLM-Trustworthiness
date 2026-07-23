@@ -11,7 +11,7 @@ def postprocess(text):
     if not text:
         return ""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<think>.*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = text.replace("</think>", "")
     for tok in ("<|im_start|>", "<|im_end|>"):
         text = text.replace(tok, "")

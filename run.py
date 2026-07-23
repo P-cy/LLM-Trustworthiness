@@ -41,8 +41,17 @@ os.environ.setdefault("TRUSTW_POLICY_PATH", "/app/prompts/policy.md")
 
 def assert_vram_budget():
     """Fail fast with a clear message if the configured VRAM budget can't fit
-    weights + guard + KV cache. This catches the CONFIG_A/B mismatch bug
-    (e.g. util 0.70 of 40GB = 28GB < 30GB FP8 weights).
+    the weights + guard + KV cache.
+
+    Architecture-aware: the vLLM pool (util*total) holds the MAIN weights + KV;
+    the guard is a separate HF-transformers process that lives in the RESIDUAL
+    GPU memory outside vLLM's pool. So:
+      - main weights must fit IN the pool:    main_gb  <= budget_gb
+      - guard must fit in the residual:      guard_gb <= (total - budget)
+    This catches the CONFIG mismatch (e.g. util 0.70 of 40GB = 28GB pool <
+    30GB FP8 weights) WITHOUT spuriously tripping when a ~23GB main + ~8GB
+    guard share a 40GB GPU: the old sum-check (main+guard <= budget) would
+    wrongly reject 23+8=31 > 28 even though the guard sits in the 12GB residual.
 
     Only meaningful on CUDA; on CPU we skip (smoke test).
     """
@@ -53,22 +62,31 @@ def assert_vram_budget():
         return  # can't detect VRAM -> skip (vLLM will surface the real error)
     util = float(os.environ.get("VLLM_GPU_MEM_UTIL", "0.68"))
     budget_gb = total_vram_gb * util
+    residual_gb = total_vram_gb - budget_gb
     main_gb = float(os.environ.get("TRUSTW_MAIN_WEIGHTS_GB", "0") or 0)
     guard_gb = float(os.environ.get("TRUSTW_GUARD_WEIGHTS_GB", "0") or 0)
     if main_gb <= 0:
         return  # unknown weights size; skip the check
-    needed_gb = main_gb + guard_gb
-    # Leave >=2GB for activations/KV beyond the util pool assumption.
-    if needed_gb > budget_gb:
+    # Main weights must fit in the vLLM pool (KV gets the remainder).
+    if main_gb > budget_gb:
         raise RuntimeError(
             f"VRAM budget too small: GPU={total_vram_gb:.0f}GB * util={util} "
-            f"= {budget_gb:.1f}GB budget, but main weights={main_gb:.1f}GB + "
-            f"guard={guard_gb:.1f}GB = {needed_gb:.1f}GB needed. "
+            f"= {budget_gb:.1f}GB vLLM pool, but main weights={main_gb:.1f}GB "
+            f"exceed the pool (KV needs the remainder). "
             f"Lower VLLM_GPU_MEM_UTIL is NOT the fix; use a smaller main model "
-            f"(CONFIG_A int4) or a smaller guard (CONFIG_B 0.6B)."
+            f"or a smaller guard."
         )
-    log(f"VRAM budget OK: {budget_gb:.1f}GB >= {needed_gb:.1f}GB "
-        f"(main+guard) on {total_vram_gb:.0f}GB GPU")
+    # Guard lives in the residual outside vLLM's pool; must fit there.
+    if guard_gb > residual_gb:
+        raise RuntimeError(
+            f"VRAM residual too small: GPU={total_vram_gb:.0f}GB - pool "
+            f"{budget_gb:.1f}GB = {residual_gb:.1f}GB residual, but guard "
+            f"weights={guard_gb:.1f}GB exceed it. Lower VLLM_GPU_MEM_UTIL to "
+            f"enlarge the residual, or use a smaller guard."
+        )
+    log(f"VRAM budget OK: pool {budget_gb:.1f}GB >= main {main_gb:.1f}GB, "
+        f"residual {residual_gb:.1f}GB >= guard {guard_gb:.1f}GB "
+        f"on {total_vram_gb:.0f}GB GPU")
 
 
 def _total_vram_gb():
@@ -130,7 +148,7 @@ def postprocess(text):
         return ""
     # Remove <think>...</think> (greedy-ish, multiline) and lone open tags.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<think>.*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"</think>", "", text, flags=re.IGNORECASE)
     # Strip chat role markers that may leak.
     for tok in ("<|im_start|>", "<|im_end|>", "<|endoftext|>"):
