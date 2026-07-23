@@ -63,10 +63,29 @@ class VLLMEngine:
                 kwargs["max_model_len"] = int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192"))
             if quant:
                 kwargs["quantization"] = quant
+            # --- Qwen3.5-35B-A3B-GPTQ-Int4 specific (Path C), env-gated, OFF by default ---
+            # Only set when the env opt-in is present, so the existing int4 path
+            # (Qwen3-30B-A3B) is unaffected. All three are forwarded by LLM(**kwargs)
+            # -> EngineArgs in vLLM 0.24 (verified in the Step 0 smoke test).
+            #   - mamba_cache_mode: Qwen3.5 is a hybrid GDN model; raises
+            #     NotImplementedError on the default "all" -> must use "align".
+            #   - language_model_only: skip the vision tower (dead weight for a
+            #     text benchmark; saves VRAM). Qwen3.5 is multimodal.
+            #   - limit_mm_per_prompt={}: belt-and-suspenders so a stray image
+            #     token can't OOM the vision path.
+            mamba_cache_mode = os.environ.get("VLLM_MAMBA_CACHE_MODE", "").strip() or None
+            if mamba_cache_mode:
+                kwargs["mamba_cache_mode"] = mamba_cache_mode
+            if os.environ.get("VLLM_LANGUAGE_MODEL_ONLY", "0") == "1":
+                kwargs["language_model_only"] = True
+                # Keep image budget at zero by default for a text-only benchmark.
+                kwargs.setdefault("limit_mm_per_prompt", {})
             print(f"[vllm] loading model from {self.MODEL_DIR}, device={device}, "
                   f"quant={quant!r}, gpu_mem_util={kwargs.get('gpu_memory_utilization')}, "
                   f"max_model_len={kwargs.get('max_model_len')}, "
-                  f"max_seqs={kwargs['max_num_seqs']}, prefix_cache=on",
+                  f"max_seqs={kwargs['max_num_seqs']}, prefix_cache=on, "
+                  f"mamba_cache_mode={kwargs.get('mamba_cache_mode')!r}, "
+                  f"lang_only={kwargs.get('language_model_only')}",
                   file=sys.stderr, flush=True)
             self.llm = LLM(**kwargs)
             self._SamplingParams = SamplingParams
@@ -84,6 +103,15 @@ class VLLMEngine:
 
         seed=None -> uses the global TRUSTW_SEED. best-of-3 passes explicit
         per-candidate seeds + temperature 0.7 for diversity.
+
+        NOTE: we pass enable_thinking=False via chat_template_kwargs as a
+        belt-and-suspenders guard against any model variant that injects a
+        thinking block. The currently baked model (Qwen3-30B-A3B-Instruct-2507)
+        is the dedicated NON-THINKING variant whose chat template has zero
+        thinking logic, so this kwarg is a no-op for it. It is NOT the fix for
+        the H=0.000 / S~0.93 result — that requires the H100 runtime logs
+        (most likely a vLLM load failure -> ready=False -> all-empty -> refusal
+        fallbacks). Set VLLM_ENABLE_THINKING=1 to re-enable if ever needed.
         """
         if not self.ready:
             return [""] * len(messages_list)
@@ -94,7 +122,15 @@ class VLLMEngine:
             max_tokens=max_tokens,
             seed=s,
         )
+        enable_thinking = os.environ.get("VLLM_ENABLE_THINKING", "0") == "1"
         try:
+            outs = self.llm.chat(
+                messages_list, sp,
+                chat_template_kwargs={"enable_thinking": enable_thinking})
+        except TypeError:
+            # Older vLLM without chat_template_kwargs in llm.chat(): fall back to
+            # the plain call so generation still works (thinking may stay on,
+            # but a working-but-truncated answer beats a hard crash to empty).
             outs = self.llm.chat(messages_list, sp)
         except Exception as e:
             print(f"[vllm] chat_batch failed: {e!r}", file=sys.stderr, flush=True)
@@ -102,7 +138,7 @@ class VLLMEngine:
         texts = []
         for o in outs:
             try:
-                texts.append(o.outputs[0].text)
+                texts.append(_strip_think(o.outputs[0].text))
             except Exception:
                 texts.append("")
         return texts
@@ -132,6 +168,27 @@ class VLLMEngine:
             for i, t in enumerate(outs):
                 all_cands[i].append(t)
         return all_cands
+
+
+def _strip_think(text):
+    """Defense-in-depth: drop any leaked reasoning/think block from raw model
+    output BEFORE it reaches verify/repair (which call chat_guided_json and
+    read raw text before the final io_csv.postprocess).
+
+    Qwen3.5's chat template closes the think block before generation when
+    enable_thinking=False (the branch we activate via chat_template_kwargs),
+    so the model SHOULD write straight to the answer. But vLLM issue #35574
+    shows a model can still emit a reasoning trace into the answer block. This
+    net catches that case: drop a closed <think>...</think> span, and if an
+    unclosed <think> leaked, drop from the open tag to end. The final
+    io_csv.postprocess strips markers again, so this is belt-and-suspenders.
+    """
+    if not text:
+        return ""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"</think>", "", text, flags=re.IGNORECASE)
+    return text
 
 
 def _extract_json(text):

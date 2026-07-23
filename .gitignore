@@ -38,3 +38,4 @@ push*.log
 
 # Claude session state (not part of the project)
 .claude/
+.venv_guard
